@@ -15,6 +15,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# Shape notation in forward methods: B = batch size, T = sequence length,
+# C = n_embd, nh = n_head, hs = C // nh, V = vocab_size.
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -24,6 +27,8 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
+        # input: (..., C); weight and optional bias: (C,).
+        # Normalize the last dimension; output preserves (..., C), usually (B, T, C).
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
@@ -50,10 +55,12 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size() # x: (B, T, C); unpack its three integer dimensions
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # c_attn: (B, T, C) -> (B, T, 3*C); split -> three tensors of shape (B, T, C).
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # Each view: (B, T, C) -> (B, T, nh, hs); transpose swaps T and nh.
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -61,19 +68,26 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
+            # q, k, v: (B, nh, T, hs) each -> y: (B, nh, T, hs).
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # k transpose: (B, nh, hs, T); q @ k^T: (B, nh, T, T).
+            # k.size(-1) is hs; multiplying by the scalar 1/sqrt(hs) preserves shape.
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Mask: (1, 1, T, T), broadcast over B and nh; att stays (B, nh, T, T).
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
+            att = F.softmax(att, dim=-1) # (B, nh, T, T) -> same; normalize over key positions
+            att = self.attn_dropout(att) # (B, nh, T, T) -> (B, nh, T, T)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # transpose: (B, nh, T, hs) -> (B, T, nh, hs); contiguous preserves shape.
+        # view merges nh and hs back into C: (B, T, nh, hs) -> (B, T, C).
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
+        # c_proj: (B, T, C) -> (B, T, C); dropout preserves (B, T, C).
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y # (B, T, C)
 
 class MLP(nn.Module):
 
@@ -85,11 +99,11 @@ class MLP(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        x = self.c_fc(x) # (B, T, C) -> (B, T, 4*C)
+        x = self.gelu(x) # (B, T, 4*C) -> (B, T, 4*C)
+        x = self.c_proj(x) # (B, T, 4*C) -> (B, T, C)
+        x = self.dropout(x) # (B, T, C) -> (B, T, C)
+        return x # (B, T, C)
 
 class Block(nn.Module):
 
@@ -101,9 +115,11 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
+        # ln_1 and attn each preserve (B, T, C); residual addition: two (B, T, C) -> (B, T, C).
         x = x + self.attn(self.ln_1(x))
+        # ln_2 and the full mlp preserve (B, T, C); residual addition also preserves shape.
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x # (B, T, C)
 
 @dataclass
 class GPTConfig:
@@ -168,29 +184,34 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+        # idx: (B, T) integer token IDs; targets: (B, T) integer IDs, or None.
+        device = idx.device # torch.device metadata, not a tensor
+        b, t = idx.size() # unpack B and T into the integer variables b and t
+        # Scalar length check; tensor shapes are unchanged.
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # (T,) integer position IDs
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        tok_emb = self.transformer.wte(idx) # (B, T) -> (B, T, C)
+        pos_emb = self.transformer.wpe(pos) # (T,) -> (T, C)
+        # Add (B, T, C) + (T, C), broadcasting over B; dropout preserves (B, T, C).
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x) # (B, T, C) -> (B, T, C) at every layer
+        x = self.transformer.ln_f(x) # (B, T, C) -> (B, T, C)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            logits = self.lm_head(x) # (B, T, C) -> (B, T, V)
+            # Flatten logits to (B*T, V) and targets to (B*T,); mean cross-entropy -> scalar ().
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
+            # x[:, [-1], :]: (B, T, C) -> (B, 1, C); lm_head -> (B, 1, V).
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            loss = None # no loss tensor when targets are absent
 
-        return logits, loss
+        return logits, loss # training: (B, T, V), scalar (); inference: (B, 1, V), None
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
