@@ -94,7 +94,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
+        self.gelu    = nn.GELU(approximate=config.gelu_approximate)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -130,6 +130,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    gelu_approximate: str = 'none' # preserve nanoGPT defaults; imported HF GPT-2 uses 'tanh'
 
 class GPT(nn.Module):
 
@@ -183,7 +184,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, *, return_all_logits=False):
         # idx: (B, T) integer token IDs; targets: (B, T) integer IDs, or None.
         device = idx.device # torch.device metadata, not a tensor
         b, t = idx.size() # unpack B and T into the integer variables b and t
@@ -200,18 +201,20 @@ class GPT(nn.Module):
             x = block(x) # (B, T, C) -> (B, T, C) at every layer
         x = self.transformer.ln_f(x) # (B, T, C) -> (B, T, C)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
+        if targets is not None or return_all_logits:
+            # Training and likelihood evaluation need predictions at every position.
             logits = self.lm_head(x) # (B, T, C) -> (B, T, V)
-            # Flatten logits to (B*T, V) and targets to (B*T,); mean cross-entropy -> scalar ().
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = None
+            if targets is not None:
+                # Flatten logits to (B*T, V) and targets to (B*T,); mean cross-entropy -> scalar ().
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             # x[:, [-1], :]: (B, T, C) -> (B, 1, C); lm_head -> (B, 1, V).
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None # no loss tensor when targets are absent
 
-        return logits, loss # training: (B, T, V), scalar (); inference: (B, 1, V), None
+        return logits, loss # full logits: (B, T, V); generation default: (B, 1, V). Loss only with targets.
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
