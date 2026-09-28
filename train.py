@@ -17,7 +17,6 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
-import time
 import math
 import pickle
 from contextlib import nullcontext
@@ -28,6 +27,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from timing import TrainingTimer
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -42,7 +42,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2'
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -263,10 +263,12 @@ if wandb_log and master_process:
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
-t0 = time.time()
+sync_device = (lambda: torch.cuda.synchronize(device)) if device_type == 'cuda' else (
+    torch.mps.synchronize if device.startswith('mps') else lambda: None)
+training_timer = TrainingTimer(synchronize=sync_device)
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0 if mfu_peak_tflops > 0 else float('nan')
+running_mfu = float('nan') # unavailable until the first window after warmup
 while True:
 
     # determine and set the learning rate for this iteration
@@ -276,6 +278,7 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
+        training_timer.pause() # retain training time so far, exclude evaluation/checkpointing
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
@@ -301,6 +304,9 @@ while True:
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
+
+    if master_process:
+        training_timer.start() # synchronize only when starting/resuming a window
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -329,20 +335,28 @@ while True:
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
+    # Measure completed updates across the logging window. Flush warmup updates
+    # individually so their compilation/startup time never enters later MFU.
+    log_now = iter_num % log_interval == 0 or iter_num >= max_iters
+    if master_process:
+        training_timer.step()
+        if local_iter_num < 5 or log_now:
+            training_timer.pause()
+    if log_now and master_process:
+        dt = training_timer.elapsed / training_timer.steps
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5 and mfu_peak_tflops > 0: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt,
-                                         peak_flops=mfu_peak_tflops * 1e12)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        if local_iter_num >= 5 and mfu_peak_tflops > 0:
+            mfu = raw_model.estimate_mfu(
+                batch_size * gradient_accumulation_steps * training_timer.steps,
+                training_timer.elapsed,
+                peak_flops=mfu_peak_tflops * 1e12)
+            running_mfu = mfu if math.isnan(running_mfu) else 0.9*running_mfu + 0.1*mfu
         grad_normf = grad_norm.item() if grad_norm is not None else float("nan")
-        print(f"iter {iter_num}: loss {lossf:.4f}, grad_norm {grad_normf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, grad_norm {grad_normf:.4f}, time {dt*1000:.2f}ms (avg over {training_timer.steps} updates), mfu {running_mfu*100:.2f}%")
+    if master_process and (local_iter_num < 5 or log_now):
+        training_timer.reset() # logging overhead stays outside the next window
     iter_num += 1
     local_iter_num += 1
 

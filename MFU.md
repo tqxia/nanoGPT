@@ -55,8 +55,37 @@ With the same model and iteration time, the old A100-normalized reading scales
 by `312 / 125 = 2.496`. For example, 4.36% becomes about **10.88%**; training speed
 and model quality have not changed.
 
-MFU remains an approximation, not `nvidia-smi` GPU utilization. This change only
-fixes the configurable hardware denominator. The existing FLOPs estimate,
-wall-clock timing, five-iteration warmup and exponential smoothing remain;
-evaluation/checkpoint overhead and asynchronous CUDA execution can affect the
-reported iteration time. Compare steady-state iterations under the same setup.
+## Measurement window
+
+`time` in the training log is now the **average milliseconds per optimizer
+update over the measured window**, whose update count is printed alongside it.
+The window normally ends every `log_interval` iterations. A final partial window
+is also logged when training finishes.
+
+`TrainingTimer` uses a monotonic wall clock and synchronizes the selected CUDA
+device (or MPS device) at segment boundaries. The end synchronization ensures
+that queued GPU work has completed before reading elapsed time. There is no
+extra synchronization between ordinary updates within a window.
+
+Before evaluation the timer pauses, keeping elapsed training time and the update
+count. It resumes after evaluation/checkpointing, even when `eval_interval` and
+`log_interval` are not aligned. Console and W&B evaluation logging are excluded
+as well. CPU batch preparation, transfers, forward/backward, optimizer work and
+normal training stalls remain part of the measured training throughput.
+
+The first five local updates are discarded from MFU timing, including after
+resume. During warmup MFU is `nan`, rather than the old `-100%` placeholder.
+Compilation during those updates is excluded; any later recompilation that
+happens during training still counts. The initial batch fetch is outside the
+window, while subsequent batch prefetches are included.
+
+MFU uses the FLOPs for **all updates in the window divided by their combined
+training time**, followed by the existing exponential smoothing (90% previous,
+10% current). In DDP this is rank 0's per-device training throughput, including
+its normal communication waits; it is not a cross-rank average. Evaluation logs
+in W&B retain the most recently completed window's smoothed MFU.
+
+MFU remains an approximation, not `nvidia-smi` GPU utilization. The PaLM-style
+FLOPs estimate and assumed hardware peak still limit its absolute accuracy.
+These measurements describe training throughput, not total job throughput
+including evaluation and checkpointing.
