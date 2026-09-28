@@ -310,8 +310,12 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+    def estimate_mfu(self, fwdbwd_per_iter, dt, peak_flops):
+        """Estimate MFU against a supplied per-device dense peak in FLOPs/second."""
+        if not math.isfinite(peak_flops) or peak_flops <= 0:
+            raise ValueError("peak_flops must be finite and positive")
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("dt must be finite and positive")
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -320,10 +324,9 @@ class GPT(nn.Module):
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        # Compare per-device throughput with the peak for the training precision.
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
+        mfu = flops_achieved / peak_flops
         return mfu
 
     @torch.no_grad()

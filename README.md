@@ -1,6 +1,8 @@
 
 # nanoGPT
 
+For this fork's GB10 MFU reference and hardware overrides, see [MFU.md](MFU.md).
+
 ![nanoGPT](assets/nanogpt.jpg)
 
 

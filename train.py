@@ -72,6 +72,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+mfu_peak_tflops = 0.0 # per-device dense peak; 0 = auto for GB10 BF16/FP16 (see MFU.md)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -107,6 +108,20 @@ torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+# Resolve the hardware denominator after DDP has selected this process's device.
+if not math.isfinite(mfu_peak_tflops) or mfu_peak_tflops < 0:
+    raise ValueError("mfu_peak_tflops must be finite and non-negative")
+if mfu_peak_tflops == 0.0:
+    if (device_type == 'cuda' and 'GB10' in torch.cuda.get_device_name(device)
+            and dtype in ('bfloat16', 'float16')):
+        mfu_peak_tflops = 125.0 # estimated dense BF16/FP16 peak, not sparse FP4
+# Save the resolved value in checkpoints and the W&B run configuration.
+config['mfu_peak_tflops'] = mfu_peak_tflops
+if master_process:
+    if mfu_peak_tflops > 0:
+        print(f"MFU peak: {mfu_peak_tflops:g} TFLOPS per device ({dtype}); see MFU.md")
+    else:
+        print("MFU unavailable: set --mfu_peak_tflops=<dense peak for your hardware and dtype>")
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
@@ -251,7 +266,7 @@ X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
+running_mfu = -1.0 if mfu_peak_tflops > 0 else float('nan')
 while True:
 
     # determine and set the learning rate for this iteration
@@ -322,8 +337,9 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+        if local_iter_num >= 5 and mfu_peak_tflops > 0: # let the training loop settle a bit
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt,
+                                         peak_flops=mfu_peak_tflops * 1e12)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         grad_normf = grad_norm.item() if grad_norm is not None else float("nan")
         print(f"iter {iter_num}: loss {lossf:.4f}, grad_norm {grad_normf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
